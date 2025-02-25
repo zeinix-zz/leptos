@@ -1,8 +1,8 @@
 use crate::{
     arc_field::{StoreFieldReader, StoreFieldWriter},
     path::{StorePath, StorePathSegment},
-    ArcField, ArcStore, AtIndex, AtKeyed, KeyMap, KeyedSubfield, Store,
-    StoreField, StoreFieldTrigger, Subfield,
+    ArcField, ArcStore, AtIndex, AtKeyed, DerefedField, KeyMap, KeyedSubfield,
+    Store, StoreField, StoreFieldTrigger, Subfield,
 };
 use reactive_graph::{
     owner::{ArenaItem, Storage, SyncStorage},
@@ -10,12 +10,11 @@ use reactive_graph::{
         DefinedAt, IsDisposed, Notify, ReadUntracked, Track, UntrackableGuard,
         Write,
     },
-    unwrap_signal,
 };
 use std::{
     fmt::Debug,
     hash::Hash,
-    ops::{DerefMut, IndexMut},
+    ops::{Deref, DerefMut, IndexMut},
     panic::Location,
 };
 
@@ -44,14 +43,14 @@ where
         self.inner
             .try_get_value()
             .map(|inner| inner.get_trigger(path))
-            .unwrap_or_else(unwrap_signal!(self))
+            .unwrap_or_default()
     }
 
     fn path(&self) -> impl IntoIterator<Item = StorePathSegment> {
         self.inner
             .try_get_value()
             .map(|inner| inner.path().into_iter().collect::<Vec<_>>())
-            .unwrap_or_else(unwrap_signal!(self))
+            .unwrap_or_default()
     }
 
     fn reader(&self) -> Option<Self::Reader> {
@@ -82,6 +81,21 @@ where
     }
 }
 
+impl<T, S> From<ArcField<T>> for Field<T, S>
+where
+    T: 'static,
+    S: Storage<ArcField<T>>,
+{
+    #[track_caller]
+    fn from(value: ArcField<T>) -> Self {
+        Field {
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            defined_at: Location::caller(),
+            inner: ArenaItem::new_with_storage(value),
+        }
+    }
+}
+
 impl<T, S> From<ArcStore<T>> for Field<T, S>
 where
     T: Send + Sync + 'static,
@@ -107,6 +121,22 @@ where
 {
     #[track_caller]
     fn from(value: Subfield<Inner, Prev, T>) -> Self {
+        Field {
+            #[cfg(any(debug_assertions, leptos_debuginfo))]
+            defined_at: Location::caller(),
+            inner: ArenaItem::new_with_storage(value.into()),
+        }
+    }
+}
+
+impl<Inner, T> From<DerefedField<Inner>> for Field<T>
+where
+    Inner: Clone + StoreField + Send + Sync + 'static,
+    Inner::Value: Deref<Target = T> + DerefMut,
+    T: Sized + 'static,
+{
+    #[track_caller]
+    fn from(value: DerefedField<Inner>) -> Self {
         Field {
             #[cfg(any(debug_assertions, leptos_debuginfo))]
             defined_at: Location::caller(),
