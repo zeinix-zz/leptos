@@ -1,20 +1,21 @@
 use crate::{children::TypedChildren, IntoView};
+use futures::{channel::oneshot, future::join_all};
 use hydration_context::{SerializedDataId, SharedContext};
 use leptos_macro::component;
 use reactive_graph::{
     computed::ArcMemo,
     effect::RenderEffect,
-    owner::{provide_context, Owner},
+    owner::{provide_context, ArcStoredValue, Owner},
     signal::ArcRwSignal,
-    traits::{Get, Update, With, WithUntracked},
+    traits::{Get, Update, With, WithUntracked, WriteValue},
 };
 use rustc_hash::FxHashMap;
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::VecDeque, fmt::Debug, mem, sync::Arc};
 use tachys::{
-    html::attribute::Attribute,
+    html::attribute::{any_attribute::AnyAttribute, Attribute},
     hydration::Cursor,
     reactive_graph::OwnedView,
-    ssr::StreamBuilder,
+    ssr::{StreamBuilder, StreamChunk},
     view::{
         add_attr::AddAnyAttr, Mountable, Position, PositionState, Render,
         RenderHtml,
@@ -96,10 +97,12 @@ where
     let hook = hook as Arc<dyn ErrorHook>;
 
     let _guard = throw_error::set_error_hook(Arc::clone(&hook));
+    let suspended_children = ErrorBoundarySuspendedChildren::default();
 
     let owner = Owner::new();
     let children = owner.with(|| {
         provide_context(Arc::clone(&hook));
+        provide_context(suspended_children.clone());
         children.into_inner()()
     });
 
@@ -111,10 +114,14 @@ where
             children,
             errors,
             fallback,
+            suspended_children,
         },
         owner,
     )
 }
+
+pub(crate) type ErrorBoundarySuspendedChildren =
+    ArcStoredValue<Vec<oneshot::Receiver<()>>>;
 
 struct ErrorBoundaryView<Chil, FalFn> {
     hook: Arc<dyn ErrorHook>,
@@ -123,6 +130,7 @@ struct ErrorBoundaryView<Chil, FalFn> {
     children: Chil,
     fallback: FalFn,
     errors: ArcRwSignal<Errors>,
+    suspended_children: ErrorBoundarySuspendedChildren,
 }
 
 struct ErrorBoundaryViewState<Chil, Fal> {
@@ -161,6 +169,14 @@ where
             fallback.insert_before_this(child)
         } else {
             self.children.insert_before_this(child)
+        }
+    }
+
+    fn elements(&self) -> Vec<tachys::renderer::types::Element> {
+        if let Some(fallback) = &self.fallback {
+            fallback.elements()
+        } else {
+            self.children.elements()
         }
     }
 }
@@ -249,6 +265,7 @@ where
             children,
             fallback,
             errors,
+            suspended_children,
         } = self;
         ErrorBoundaryView {
             hook,
@@ -257,6 +274,7 @@ where
             children: children.add_any_attr(attr.into_cloneable_owned()),
             fallback,
             errors,
+            suspended_children,
         }
     }
 }
@@ -268,6 +286,7 @@ where
     Fal: RenderHtml + Send + 'static,
 {
     type AsyncOutput = ErrorBoundaryView<Chil::AsyncOutput, FalFn>;
+    type Owned = Self;
 
     const MIN_LENGTH: usize = Chil::MIN_LENGTH;
 
@@ -283,6 +302,7 @@ where
             children,
             fallback,
             errors,
+            suspended_children,
             ..
         } = self;
         ErrorBoundaryView {
@@ -292,6 +312,7 @@ where
             children: children.resolve().await,
             fallback,
             errors,
+            suspended_children,
         }
     }
 
@@ -301,6 +322,7 @@ where
         position: &mut Position,
         escape: bool,
         mark_branches: bool,
+        extra_attrs: Vec<AnyAttribute>,
     ) {
         // first, attempt to serialize the children to HTML, then check for errors
         let _hook = throw_error::set_error_hook(self.hook);
@@ -311,6 +333,7 @@ where
             &mut new_pos,
             escape,
             mark_branches,
+            extra_attrs.clone(),
         );
 
         // any thrown errors would've been caught here
@@ -323,6 +346,7 @@ where
                 position,
                 escape,
                 mark_branches,
+                extra_attrs,
             );
         }
     }
@@ -333,10 +357,12 @@ where
         position: &mut Position,
         escape: bool,
         mark_branches: bool,
+        extra_attrs: Vec<AnyAttribute>,
     ) where
         Self: Sized,
     {
-        let _hook = throw_error::set_error_hook(self.hook);
+        let _hook = throw_error::set_error_hook(Arc::clone(&self.hook));
+
         // first, attempt to serialize the children to HTML, then check for errors
         let mut new_buf = StreamBuilder::new(buf.clone_id());
         let mut new_pos = *position;
@@ -345,21 +371,79 @@ where
             &mut new_pos,
             escape,
             mark_branches,
+            extra_attrs.clone(),
         );
 
-        // any thrown errors would've been caught here
-        if self.errors.with_untracked(|map| map.is_empty()) {
-            buf.append(new_buf);
+        let suspense_children =
+            mem::take(&mut *self.suspended_children.write_value());
+
+        // not waiting for any suspended children: just render
+        if suspense_children.is_empty() {
+            // any thrown errors would've been caught here
+            if self.errors.with_untracked(|map| map.is_empty()) {
+                buf.append(new_buf);
+            } else {
+                // otherwise, serialize the fallback instead
+                let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
+                (self.fallback)(self.errors).to_html_with_buf(
+                    &mut fallback,
+                    position,
+                    escape,
+                    mark_branches,
+                    extra_attrs,
+                );
+                buf.push_sync(&fallback);
+            }
         } else {
-            // otherwise, serialize the fallback instead
-            let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
-            (self.fallback)(self.errors).to_html_with_buf(
-                &mut fallback,
-                position,
-                escape,
-                mark_branches,
-            );
-            buf.push_sync(&fallback);
+            let mut position = *position;
+            // if we're waiting for suspended children, we'll first wait for them to load
+            // in this implementation, an ErrorBoundary that *contains* Suspense essentially acts
+            // like a Suspense: it will wait for (all top-level) child Suspense to load before rendering anything
+            let mut view_buf = StreamBuilder::new(new_buf.clone_id());
+            view_buf.next_id();
+            let hook = Arc::clone(&self.hook);
+            view_buf.push_async(async move {
+                let _hook = throw_error::set_error_hook(Arc::clone(&hook));
+                let _ = join_all(suspense_children).await;
+
+                let mut my_chunks = VecDeque::new();
+                for chunk in new_buf.take_chunks() {
+                    match chunk {
+                        StreamChunk::Sync(data) => {
+                            my_chunks.push_back(StreamChunk::Sync(data))
+                        }
+                        StreamChunk::Async { chunks } => {
+                            let chunks = chunks.await;
+                            my_chunks.extend(chunks);
+                        }
+                        StreamChunk::OutOfOrder { chunks } => {
+                            let chunks = chunks.await;
+                            my_chunks.push_back(StreamChunk::OutOfOrder {
+                                chunks: Box::pin(async move { chunks }),
+                            });
+                        }
+                    }
+                }
+
+                if self.errors.with_untracked(|map| map.is_empty()) {
+                    // if no errors, just go ahead with the stream
+                    my_chunks
+                } else {
+                    // otherwise, serialize the fallback instead
+                    let mut fallback = String::with_capacity(Fal::MIN_LENGTH);
+                    (self.fallback)(self.errors).to_html_with_buf(
+                        &mut fallback,
+                        &mut position,
+                        escape,
+                        mark_branches,
+                        extra_attrs,
+                    );
+                    my_chunks.clear();
+                    my_chunks.push_back(StreamChunk::Sync(fallback));
+                    my_chunks
+                }
+            });
+            buf.append(view_buf);
         }
     }
 
@@ -422,6 +506,10 @@ where
                 }
             },
         )
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        self
     }
 }
 

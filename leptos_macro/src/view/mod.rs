@@ -428,6 +428,12 @@ fn element_children_to_tokens(
                 { #child }
             )
         })
+    } else if cfg!(feature = "__internal_erase_components") {
+        Some(quote! {
+            .child(
+                leptos::tachys::view::iterators::StaticVec::from(vec![#(#children.into_maybe_erased()),*])
+            )
+        })
     } else if children.len() > 16 {
         // implementations of various traits used in routing and rendering are implemented for
         // tuples of sizes 0, 1, 2, 3, ... N. N varies but is > 16. The traits are also implemented
@@ -473,6 +479,10 @@ fn fragment_to_tokens(
         None
     } else if children.len() == 1 {
         children.into_iter().next()
+    } else if cfg!(feature = "__internal_erase_components") {
+        Some(quote! {
+            leptos::tachys::view::iterators::StaticVec::from(vec![#(#children.into_maybe_erased()),*])
+        })
     } else if children.len() > 16 {
         // implementations of various traits used in routing and rendering are implemented for
         // tuples of sizes 0, 1, 2, 3, ... N. N varies but is > 16. The traits are also implemented
@@ -601,7 +611,7 @@ fn node_to_tokens(
 
 fn text_to_tokens(text: &LitStr) -> TokenStream {
     // on nightly, can use static string optimization
-    if cfg!(feature = "nightly") {
+    if cfg!(all(feature = "nightly", rustc_nightly)) {
         quote! {
             ::leptos::tachys::view::static_types::Static::<#text>
         }
@@ -681,6 +691,13 @@ pub(crate) fn element_to_tokens(
 
     // check for duplicate attribute names and emit an error for all subsequent ones
     let mut names = HashSet::new();
+
+    // allow multiple class=(...) or style=(...) attributes
+    fn allow_multiples(name: &str, attr: &KeyedAttribute) -> bool {
+        (name == "class" || name == "style")
+            && matches!(attr.value(), Some(Expr::Tuple(..)))
+    }
+
     for attr in node.attributes() {
         if let NodeAttribute::Attribute(attr) = attr {
             let mut name = attr.key.to_string();
@@ -697,7 +714,7 @@ pub(crate) fn element_to_tokens(
                     }
                 }
             }
-            if names.contains(&name) {
+            if names.contains(&name) && !allow_multiples(&name, attr) {
                 proc_macro_error2::emit_error!(
                     attr.span(),
                     format!("This element already has a `{name}` attribute.")
@@ -757,10 +774,18 @@ pub(crate) fn element_to_tokens(
                 }
             }
         }
-        Some(quote! {
-            (#(#attributes,)*)
-            #(.add_any_attr(#additions))*
-        })
+
+        if cfg!(feature = "__internal_erase_components") {
+            Some(quote! {
+                vec![#(#attributes.into_any_attr(),)*]
+                #(.add_any_attr(#additions))*
+            })
+        } else {
+            Some(quote! {
+                (#(#attributes,)*)
+                #(.add_any_attr(#additions))*
+            })
+        }
     } else {
         let tag = name.to_string();
         // collect close_tag name to emit semantic information for IDE.
@@ -1157,8 +1182,14 @@ pub(crate) fn two_way_binding_to_tokens(
     let ident =
         format_ident!("{}", name.to_case(UpperCamel), span = node.key.span());
 
-    quote! {
-        .bind(::leptos::attr::#ident, #value)
+    if name == "group" {
+        quote! {
+            .bind(leptos::tachys::reactive_graph::bind::#ident, #value)
+        }
+    } else {
+        quote! {
+            .bind(::leptos::attr::#ident, #value)
+        }
     }
 }
 
@@ -1488,7 +1519,7 @@ fn attribute_value(
         Some(value) => match &value.value {
             KVAttributeValue::Expr(expr) => {
                 if let Expr::Lit(lit) = expr {
-                    if cfg!(feature = "nightly") {
+                    if cfg!(all(feature = "nightly", rustc_nightly)) {
                         if let Lit::Str(str) = &lit.lit {
                             return quote! {
                                 ::leptos::tachys::view::static_types::Static::<#str>

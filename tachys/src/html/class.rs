@@ -473,7 +473,7 @@ impl IntoClass for Arc<str> {
 
     fn rebuild(self, state: &mut Self::State) {
         let (el, prev) = state;
-        if !Arc::ptr_eq(&self, prev) {
+        if self != *prev {
             Rndr::set_attribute(el, "class", &self);
         }
         *prev = self;
@@ -571,7 +571,7 @@ impl IntoClass for (&'static str, bool) {
     }
 }
 
-#[cfg(feature = "nightly")]
+#[cfg(all(feature = "nightly", rustc_nightly))]
 impl<const V: &'static str> IntoClass for crate::view::static_types::Static<V> {
     const TEMPLATE: &'static str = V;
 

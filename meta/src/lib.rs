@@ -44,7 +44,7 @@
 
 use futures::{Stream, StreamExt};
 use leptos::{
-    attr::NextAttribute,
+    attr::{any_attribute::AnyAttribute, NextAttribute},
     component,
     logging::debug_warn,
     oco::Oco,
@@ -216,6 +216,13 @@ impl ServerMetaContextOutput {
         self,
         mut stream: impl Stream<Item = String> + Send + Unpin,
     ) -> impl Stream<Item = String> + Send {
+        // if the first chunk consists of a synchronously-available Suspend,
+        // inject_meta_context can accidentally run a tick before it, but the Suspend
+        // when both are available. waiting a tick before awaiting the first chunk
+        // in the Stream ensures that this always runs after that first chunk
+        // see https://github.com/leptos-rs/leptos/issues/3976 for the original issue
+        leptos::task::tick().await;
+
         // wait for the first chunk of the stream, to ensure our components hve run
         let mut first_chunk = stream.next().await.unwrap_or_default();
 
@@ -242,23 +249,22 @@ impl ServerMetaContextOutput {
             let head_loc = first_chunk
                 .find("</head>")
                 .expect("you are using leptos_meta without a </head> tag");
-            let marker_loc =
-                first_chunk.find("<!--HEAD-->").unwrap_or_else(|| {
+            let marker_loc = first_chunk
+                .find("<!--HEAD-->")
+                .map(|pos| pos + "<!--HEAD-->".len())
+                .unwrap_or_else(|| {
                     first_chunk.find("</head>").unwrap_or(head_loc)
                 });
             let (before_marker, after_marker) =
                 first_chunk.split_at_mut(marker_loc);
-            let (before_head_close, after_head) =
-                after_marker.split_at_mut(head_loc - marker_loc);
             buf.push_str(before_marker);
+            buf.push_str(&meta_buf);
             if let Some(title) = title {
                 buf.push_str("<title>");
                 buf.push_str(&title);
                 buf.push_str("</title>");
             }
-            buf.push_str(before_head_close);
-            buf.push_str(&meta_buf);
-            buf.push_str(after_head);
+            buf.push_str(after_marker);
             buf
         };
 
@@ -405,6 +411,7 @@ where
     Ch: RenderHtml + Send,
 {
     type AsyncOutput = Self;
+    type Owned = RegisteredMetaTag<E, At::CloneableOwned, Ch::Owned>;
 
     const MIN_LENGTH: usize = 0;
 
@@ -422,6 +429,7 @@ where
         _position: &mut Position,
         _escape: bool,
         _mark_branches: bool,
+        _extra_attrs: Vec<AnyAttribute>,
     ) {
         // meta tags are rendered into the buffer stored into the context
         // the value has already been taken out, when we're on the server
@@ -433,6 +441,7 @@ where
                 &mut Position::NextChild,
                 false,
                 false,
+                vec![],
             );
             _ = cx.elements.send(buf); // fails only if the receiver is already dropped
         } else {
@@ -443,7 +452,7 @@ where
             tracing::warn!("{}", msg);
 
             #[cfg(not(feature = "tracing"))]
-            eprintln!("{}", msg);
+            eprintln!("{msg}");
         }
     }
 
@@ -463,6 +472,12 @@ where
             &PositionState::new(Position::NextChild),
         );
         RegisteredMetaTagState { state }
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        RegisteredMetaTag {
+            el: self.el.into_owned(),
+        }
     }
 }
 
@@ -495,6 +510,10 @@ where
         // the alternate view will end up being mounted in the <head> -- which is not at all what
         // we intended!
         false
+    }
+
+    fn elements(&self) -> Vec<leptos::tachys::renderer::types::Element> {
+        self.state.elements()
     }
 }
 
@@ -537,6 +556,7 @@ impl AddAnyAttr for MetaTagsView {
 
 impl RenderHtml for MetaTagsView {
     type AsyncOutput = Self;
+    type Owned = Self;
 
     const MIN_LENGTH: usize = 0;
 
@@ -552,6 +572,7 @@ impl RenderHtml for MetaTagsView {
         _position: &mut Position,
         _escape: bool,
         _mark_branches: bool,
+        _extra_attrs: Vec<AnyAttribute>,
     ) {
         buf.push_str("<!--HEAD-->");
     }
@@ -561,6 +582,10 @@ impl RenderHtml for MetaTagsView {
         _cursor: &Cursor,
         _position: &PositionState,
     ) -> Self::State {
+    }
+
+    fn into_owned(self) -> Self::Owned {
+        self
     }
 }
 

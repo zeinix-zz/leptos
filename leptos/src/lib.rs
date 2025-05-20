@@ -141,8 +141,8 @@
 //! }
 //! ```
 
-#![cfg_attr(feature = "nightly", feature(fn_traits))]
-#![cfg_attr(feature = "nightly", feature(unboxed_closures))]
+#![cfg_attr(all(feature = "nightly", rustc_nightly), feature(fn_traits))]
+#![cfg_attr(all(feature = "nightly", rustc_nightly), feature(unboxed_closures))]
 
 extern crate self as leptos;
 
@@ -162,6 +162,7 @@ pub mod prelude {
         pub use crate::{
             callback::*, children::*, component::*, control_flow::*, error::*,
             form::*, hydration::*, into_view::*, mount::*, suspense::*,
+            text_prop::*,
         };
         pub use leptos_config::*;
         pub use leptos_dom::helpers::*;
@@ -169,15 +170,21 @@ pub mod prelude {
         pub use leptos_server::*;
         pub use oco_ref::*;
         pub use reactive_graph::{
-            actions::*, computed::*, effect::*, graph::untrack, owner::*,
-            signal::*, wrappers::read::*,
+            actions::*,
+            computed::*,
+            effect::*,
+            graph::untrack,
+            owner::*,
+            signal::*,
+            wrappers::{read::*, write::*},
         };
-        pub use server_fn::{self, ServerFnError};
+        pub use server_fn::{
+            self,
+            error::{FromServerFnError, ServerFnError, ServerFnErrorErr},
+        };
         pub use tachys::{
             reactive_graph::{bind::BindAttribute, node_ref::*, Suspend},
-            view::{
-                any_view::AnyView, fragment::Fragment, template::ViewTemplate,
-            },
+            view::{fragment::Fragment, template::ViewTemplate},
         };
     }
     pub use export_types::*;
@@ -293,14 +300,18 @@ pub mod logging {
 
 /// Utilities for working with asynchronous tasks.
 pub mod task {
-    pub use any_spawner::{self, CustomExecutor, Executor};
+    use any_spawner::Executor;
     use std::future::Future;
 
     /// Spawns a thread-safe [`Future`].
     #[track_caller]
     #[inline(always)]
     pub fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
-        Executor::spawn(fut)
+        #[cfg(not(target_family = "wasm"))]
+        Executor::spawn(fut);
+
+        #[cfg(target_family = "wasm")]
+        Executor::spawn_local(fut);
     }
 
     /// Spawns a [`Future`] that cannot be sent across threads.
